@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #667085;
+    --line: #e2e6ec; --accent: #2563eb; --accent-ink: #ffffff;
+    --card: #ffffff; --shadow: 0 1px 2px rgba(16,24,40,.08);
+  }
+  [data-theme="dark"] {
+    --bg: #10141b; --panel: #181e28; --ink: #e8ecf3; --muted: #94a0b4;
+    --line: #2a3342; --accent: #5b8def; --accent-ink: #0c1118;
+    --card: #1f2733; --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  header h1 { font-size: 16px; margin: 0; flex: 1; }
+  header button {
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 13px;
+  }
+  #banner {
+    display: none; margin-bottom: 10px; padding: 8px 10px; border-radius: 6px;
+    background: #fff7e6; color: #7a4d00; border: 1px solid #ffe1a8; font-size: 13px;
+  }
+  #banner.on { display: block; }
+  #board { display: flex; gap: 10px; align-items: flex-start; }
+  .col {
+    flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px; box-shadow: var(--shadow);
+  }
+  .col.dragover { outline: 2px dashed var(--accent); outline-offset: -2px; }
+  .col h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); margin: 2px 4px 8px; display: flex; justify-content: space-between;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; margin-bottom: 8px; cursor: grab; box-shadow: var(--shadow);
+    display: flex; align-items: flex-start; gap: 6px;
+  }
+  .card:active { cursor: grabbing; }
+  .card .title { flex: 1; word-break: break-word; }
+  .card .del {
+    border: 0; background: none; color: var(--muted); cursor: pointer;
+    font-size: 14px; padding: 0 2px; line-height: 1;
+  }
+  .card .del:hover { color: #d92d20; }
+  .add { display: flex; gap: 6px; margin-top: 2px; }
+  .add input {
+    flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font-size: 13px; background: var(--bg); color: var(--ink);
+  }
+  .add button {
+    border: 0; border-radius: 6px; background: var(--accent); color: var(--accent-ink);
+    padding: 6px 10px; cursor: pointer; font-size: 13px;
+  }
+  .empty { color: var(--muted); font-size: 12px; margin: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Board</h1>
+  <button id="fs" type="button" title="Toggle fullscreen">Fullscreen</button>
+</header>
+<div id="banner">Standalone preview - open this app through an MCP Apps
+host (io.modelcontextprotocol/ui) to edit the real board.</div>
+<div id="board"></div>
+
+<script>
+"use strict";
+/* MCP Apps view-side bridge (SEP-1865, spec 2026-01-26): JSON-RPC 2.0
+   over postMessage. No SDK - the spec's own minimal pattern. */
+var nextId = 1;
+var pending = {};
+function sendRequest(method, params) {
+  var id = nextId++;
+  return new Promise(function (resolve, reject) {
+    pending[id] = { resolve: resolve, reject: reject };
+    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params }, "*");
+  });
+}
+function sendNotification(method, params) {
+  window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params }, "*");
+}
+var handlers = {};
+function onNotification(method, handler) { handlers[method] = handler; }
+window.addEventListener("message", function (event) {
+  var data = event.data;
+  if (!data || typeof data !== "object") return;
+  /* Standalone preview posts reach ourselves; only settle a request on a
+     real response (one carrying result or error), never on the echo. */
+  if (data.id !== undefined && pending[data.id] &&
+      ("result" in data || "error" in data)) {
+    var p = pending[data.id];
+    delete pending[data.id];
+    if (data.error) p.reject(new Error(data.error.message || "request failed"));
+    else p.resolve(data.result);
+  } else if (data.method && handlers[data.method]) {
+    handlers[data.method](data.params || {});
+  }
+});
+
+var state = { board: null, connected: false };
+
+function boardFromResult(result) {
+  if (result && result.structuredContent && result.structuredContent.board) {
+    return result.structuredContent.board;
+  }
+  return null;
+}
+
+function render(board) {
+  if (board) state.board = board;
+  var host = document.getElementById("board");
+  host.innerHTML = "";
+  if (!state.board) {
+    host.innerHTML = '<p class="empty">Loading board\u2026</p>';
+    return;
+  }
+  state.board.columns.forEach(function (col) {
+    var el = document.createElement("section");
+    el.className = "col";
+    el.dataset.column = col.id;
+    var h = document.createElement("h2");
+    h.textContent = col.title;
+    var count = document.createElement("span");
+    count.textContent = col.cards.length;
+    h.appendChild(count);
+    el.appendChild(h);
+    if (!col.cards.length) {
+      var e = document.createElement("p");
+      e.className = "empty";
+      e.textContent = "Drop cards here";
+      el.appendChild(e);
+    }
+    col.cards.forEach(function (card, index) {
+      el.appendChild(cardEl(card, index));
+    });
+    var add = document.createElement("form");
+    add.className = "add";
+    add.innerHTML = '<input maxlength="200" placeholder="Add a card\u2026" aria-label="Card title">';
+    var btn = document.createElement("button");
+    btn.type = "submit";
+    btn.textContent = "Add";
+    add.appendChild(btn);
+    add.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var input = add.querySelector("input");
+      var title = input.value.trim();
+      if (!title) return;
+      input.value = "";
+      callTool("add_card", { title: title, column: col.id });
+    });
+    el.appendChild(add);
+    el.addEventListener("dragover", function (ev) {
+      ev.preventDefault();
+      el.classList.add("dragover");
+    });
+    el.addEventListener("dragleave", function () { el.classList.remove("dragover"); });
+    el.addEventListener("drop", function (ev) {
+      ev.preventDefault();
+      el.classList.remove("dragover");
+      var id = ev.dataTransfer.getData("text/plain");
+      if (id) callTool("move_card", { id: id, column: col.id });
+    });
+    host.appendChild(el);
+  });
+}
+
+function cardEl(card, index) {
+  var el = document.createElement("div");
+  el.className = "card";
+  el.draggable = true;
+  el.dataset.id = card.id;
+  var title = document.createElement("span");
+  title.className = "title";
+  title.textContent = card.title;
+  title.title = "Double-click to rename";
+  title.addEventListener("dblclick", function () {
+    var next = window.prompt("Rename card", card.title);
+    if (next && next.trim() && next.trim() !== card.title) {
+      callTool("rename_card", { id: card.id, title: next.trim() });
+    }
+  });
+  el.addEventListener("dragstart", function (ev) {
+    ev.dataTransfer.setData("text/plain", card.id);
+  });
+  var del = document.createElement("button");
+  del.className = "del";
+  del.type = "button";
+  del.textContent = "\u00d7";
+  del.title = "Delete card";
+  del.addEventListener("click", function () {
+    callTool("delete_card", { id: card.id });
+  });
+  el.appendChild(title);
+  el.appendChild(del);
+  return el;
+}
+
+function summarize(board) {
+  return board.columns.map(function (c) {
+    return c.title + " (" + c.cards.length + "): " +
+      c.cards.map(function (card) { return card.title; }).join(", ");
+  }).join("\n");
+}
+
+function callTool(name, args) {
+  if (!state.connected) return;
+  sendRequest("tools/call", { name: name, arguments: args }).then(function (result) {
+    var board = boardFromResult(result);
+    if (board) {
+      render(board);
+      sendRequest("ui/update-model-context", {
+        content: [{ type: "text", text: "Board updated via the UI:\n" + summarize(board) }]
+      }).catch(function () {});
+    }
+  }).catch(function (err) {
+    render();
+    var b = document.getElementById("banner");
+    b.textContent = name + " failed: " + err.message;
+    b.classList.add("on");
+  });
+}
+
+onNotification("ui/notifications/tool-input", function (params) {
+  /* The model called a board tool; arguments arrive before the result. */
+  render();
+});
+onNotification("ui/notifications/tool-result", function (params) {
+  var board = boardFromResult(params);
+  if (board) render(board);
+});
+onNotification("ui/notifications/host-context-changed", function (params) {
+  if (params.theme === "dark" || params.theme === "light") {
+    document.documentElement.dataset.theme = params.theme;
+  }
+});
+onNotification("ui/notifications/tool-cancelled", function () { render(); });
+
+document.getElementById("fs").addEventListener("click", function () {
+  if (!state.connected) return;
+  sendRequest("ui/request-display-mode", { mode: "fullscreen" }).catch(function () {});
+});
+
+/* Handshake: ui/initialize, then ui/notifications/initialized. Without
+   a host (standalone file preview), show a demo board after 2.5s. */
+var connected = false;
+sendRequest("ui/initialize", {
+  protocolVersion: "2026-01-26",
+  clientInfo: { name: "apps-board-view", version: "1.0.0" },
+  capabilities: {},
+  appCapabilities: { tools: {}, availableDisplayModes: ["inline", "fullscreen"] }
+}).then(function (initResult) {
+  connected = true;
+  state.connected = true;
+  if (initResult && initResult.hostContext && initResult.hostContext.theme) {
+    document.documentElement.dataset.theme = initResult.hostContext.theme;
+  }
+  sendNotification("ui/notifications/initialized", {});
+  render();
+}).catch(function () {});
+setTimeout(function () {
+  if (!connected) {
+    document.getElementById("banner").classList.add("on");
+    render({ columns: [
+      { id: "todo", title: "To Do", cards: [
+        { id: "demo-1", title: "Try the board via an MCP Apps host" }] },
+      { id: "doing", title: "Doing", cards: [] },
+      { id: "done", title: "Done", cards: [] }
+    ] });
+  }
+}, 2500);
+render();
+</script>
+</body>
+</html>
